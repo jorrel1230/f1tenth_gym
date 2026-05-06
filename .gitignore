@@ -9,6 +9,8 @@ gym/f110_gym/unittest/centerline/
 docs/_build/
 *.mypy_cache/
 flycheck_*
-
-.venv-rl
-runs
+.venv-rl/
+runs/
+*.tfevents.*
+.pytest_cache/
+results

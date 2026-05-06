@@ -13,5 +13,16 @@ setup(name='f110_gym',
                         'numba>=0.55.2',
                         'pyyaml>=5.3.1',
                         'pyglet<1.5',
-                        'pyopengl']
+                        'pyopengl'],
+      extras_require={
+          'rl': [
+              'gymnasium>=0.29',
+              'stable-baselines3>=2.0',
+              'torch',
+              'tensorboard',
+              'matplotlib',
+              'scikit-image',
+              'pytest',
+          ],
+      },
       )

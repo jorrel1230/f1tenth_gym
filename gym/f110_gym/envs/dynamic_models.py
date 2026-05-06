@@ -22,9 +22,13 @@ Author: Hongrui Zheng
 
 import numpy as np
 from numba import njit
+import math
 
 import unittest
 import time
+
+from f110_gym.envs.tire_pacejka import pacejka_lat, friction_ellipse
+
 
 @njit(cache=True)
 def accl_constraints(vel, accl, v_switch, a_max, v_min, v_max):
@@ -88,7 +92,7 @@ def steering_constraint(steering_angle, steering_velocity, s_min, s_max, sv_min,
 
 
 @njit(cache=True)
-def vehicle_dynamics_ks(x, u_init, mu, C_Sf, C_Sr, lf, lr, h, m, I, s_min, s_max, sv_min, sv_max, v_switch, a_max, v_min, v_max):
+def vehicle_dynamics_ks(x, u_init, mu, C_Sf, C_Sr, lf, lr, h, m, I, s_min, s_max, sv_min, sv_max, v_switch, a_max, v_min, v_max, Cd_A, rho_air):
     """
     Single Track Kinematic Vehicle Dynamics.
 
@@ -102,6 +106,8 @@ def vehicle_dynamics_ks(x, u_init, mu, C_Sf, C_Sr, lf, lr, h, m, I, s_min, s_max
             u (numpy.ndarray (2, )): control input vector (u1, u2)
                 u1: steering angle velocity of front wheels
                 u2: longitudinal acceleration
+            Cd_A (float): aerodynamic drag coefficient times frontal area [m^2]
+            rho_air (float): air density [kg/m^3]
 
         Returns:
             f (numpy.ndarray): right hand side of differential equations
@@ -112,16 +118,20 @@ def vehicle_dynamics_ks(x, u_init, mu, C_Sf, C_Sr, lf, lr, h, m, I, s_min, s_max
     # constraints
     u = np.array([steering_constraint(x[2], u_init[0], s_min, s_max, sv_min, sv_max), accl_constraints(x[3], u_init[1], v_switch, a_max, v_min, v_max)])
 
+    # aerodynamic drag deceleration (opposes velocity, quadratic in speed)
+    a_drag = -0.5 * rho_air * Cd_A * x[3] * abs(x[3]) / m
+    a_long = u[1] + a_drag
+
     # system dynamics
     f = np.array([x[3]*np.cos(x[4]),
          x[3]*np.sin(x[4]),
          u[0],
-         u[1],
+         a_long,
          x[3]/lwb*np.tan(x[2])])
     return f
 
 @njit(cache=True)
-def vehicle_dynamics_st(x, u_init, mu, C_Sf, C_Sr, lf, lr, h, m, I, s_min, s_max, sv_min, sv_max, v_switch, a_max, v_min, v_max):
+def vehicle_dynamics_st(x, u_init, mu, C_Sf, C_Sr, lf, lr, h, m, I, s_min, s_max, sv_min, sv_max, v_switch, a_max, v_min, v_max, Cd_A, rho_air, pac_B, pac_C, pac_D_scale, pac_E):
     """
     Single Track Dynamic Vehicle Dynamics.
 
@@ -137,6 +147,12 @@ def vehicle_dynamics_st(x, u_init, mu, C_Sf, C_Sr, lf, lr, h, m, I, s_min, s_max
             u (numpy.ndarray (2, )): control input vector (u1, u2)
                 u1: steering angle velocity of front wheels
                 u2: longitudinal acceleration
+            Cd_A (float): aerodynamic drag coefficient times frontal area [m^2]
+            rho_air (float): air density [kg/m^3]
+            pac_B, pac_C, pac_D_scale, pac_E: Pacejka 89 lateral coefficients.
+                pac_D_scale > 0 enables Pacejka tires (saturating peak grip);
+                pac_D_scale == 0 keeps the legacy linear cornering-stiffness
+                model (back-compat for F110_PARAMS).
 
         Returns:
             f (numpy.ndarray): right hand side of differential equations
@@ -148,30 +164,76 @@ def vehicle_dynamics_st(x, u_init, mu, C_Sf, C_Sr, lf, lr, h, m, I, s_min, s_max
     # constraints
     u = np.array([steering_constraint(x[2], u_init[0], s_min, s_max, sv_min, sv_max), accl_constraints(x[3], u_init[1], v_switch, a_max, v_min, v_max)])
 
+    # aerodynamic drag deceleration (opposes velocity, quadratic in speed)
+    a_drag = -0.5 * rho_air * Cd_A * x[3] * abs(x[3]) / m
+    a_long = u[1] + a_drag
+
     # switch to kinematic model for small velocities
     if abs(x[3]) < 0.5:
         # wheelbase
         lwb = lf + lr
 
-        # system dynamics
+        # system dynamics; _ks call passes u (engine cmd): drag already applied inside _ks
         x_ks = x[0:5]
-        f_ks = vehicle_dynamics_ks(x_ks, u, mu, C_Sf, C_Sr, lf, lr, h, m, I, s_min, s_max, sv_min, sv_max, v_switch, a_max, v_min, v_max)
-        f = np.hstack((f_ks, np.array([u[1]/lwb*np.tan(x[2])+x[3]/(lwb*np.cos(x[2])**2)*u[0],
+        f_ks = vehicle_dynamics_ks(x_ks, u, mu, C_Sf, C_Sr, lf, lr, h, m, I, s_min, s_max, sv_min, sv_max, v_switch, a_max, v_min, v_max, Cd_A, rho_air)
+        f = np.hstack((f_ks, np.array([a_long/lwb*np.tan(x[2])+x[3]/(lwb*np.cos(x[2])**2)*u[0],
         0])))
 
+    elif pac_D_scale > 0.0:
+        # Pacejka tire pat: replace linear cornering stifness with magic-formula
+        # lateral force per axle. Saturates near mu*Fz so high slip stops generating
+        # ever-more yaw, agent must brake before corners (RL training intent).
+        delta = x[2]
+        v = x[3]
+        psi = x[4]
+        r = x[5]
+        beta = x[6]
+
+        # textbook bicycle slip angles
+        v_x = v * math.cos(beta)
+        v_y = v * math.sin(beta)
+        alpha_f = delta - math.atan2(v_y + lf * r, v_x)
+        alpha_r = -math.atan2(v_y - lr * r, v_x)
+
+        # axle vertical loads incl. longitudinal weight transfer
+        Fz_f = m * (g * lr - a_long * h) / (lf + lr)
+        Fz_r = m * (g * lf + a_long * h) / (lf + lr)
+        if Fz_f < 0.0:
+            Fz_f = 0.0
+        if Fz_r < 0.0:
+            Fz_r = 0.0
+
+        F_yf = pacejka_lat(alpha_f, Fz_f, mu, pac_B, pac_C, pac_D_scale, pac_E)
+        F_yr = pacejka_lat(alpha_r, Fz_r, mu, pac_B, pac_C, pac_D_scale, pac_E)
+
+        cos_d = math.cos(delta)
+        r_dot = (lf * F_yf * cos_d - lr * F_yr) / I
+        beta_dot = (F_yf * cos_d + F_yr) / (m * v) - r
+
+        f = np.array([
+            v * math.cos(beta + psi),
+            v * math.sin(beta + psi),
+            u[0],
+            a_long,
+            r,
+            r_dot,
+            beta_dot,
+        ])
+
     else:
-        # system dynamics
+        # Legacy linear-cornering-stiffness path (kept for back-compat with
+        # F110_PARAMS / pac_D_scale==0 callers).
         f = np.array([x[3]*np.cos(x[6] + x[4]),
             x[3]*np.sin(x[6] + x[4]),
             u[0],
-            u[1],
+            a_long,
             x[5],
-            -mu*m/(x[3]*I*(lr+lf))*(lf**2*C_Sf*(g*lr-u[1]*h) + lr**2*C_Sr*(g*lf + u[1]*h))*x[5] \
-                +mu*m/(I*(lr+lf))*(lr*C_Sr*(g*lf + u[1]*h) - lf*C_Sf*(g*lr - u[1]*h))*x[6] \
-                +mu*m/(I*(lr+lf))*lf*C_Sf*(g*lr - u[1]*h)*x[2],
-            (mu/(x[3]**2*(lr+lf))*(C_Sr*(g*lf + u[1]*h)*lr - C_Sf*(g*lr - u[1]*h)*lf)-1)*x[5] \
-                -mu/(x[3]*(lr+lf))*(C_Sr*(g*lf + u[1]*h) + C_Sf*(g*lr-u[1]*h))*x[6] \
-                +mu/(x[3]*(lr+lf))*(C_Sf*(g*lr-u[1]*h))*x[2]])
+            -mu*m/(x[3]*I*(lr+lf))*(lf**2*C_Sf*(g*lr-a_long*h) + lr**2*C_Sr*(g*lf + a_long*h))*x[5] \
+                +mu*m/(I*(lr+lf))*(lr*C_Sr*(g*lf + a_long*h) - lf*C_Sf*(g*lr - a_long*h))*x[6] \
+                +mu*m/(I*(lr+lf))*lf*C_Sf*(g*lr - a_long*h)*x[2],
+            (mu/(x[3]**2*(lr+lf))*(C_Sr*(g*lf + a_long*h)*lr - C_Sf*(g*lr - a_long*h)*lf)-1)*x[5] \
+                -mu/(x[3]*(lr+lf))*(C_Sr*(g*lf + a_long*h) + C_Sf*(g*lr-a_long*h))*x[6] \
+                +mu/(x[3]*(lr+lf))*(C_Sf*(g*lr-a_long*h))*x[2]])
 
     return f
 
@@ -220,12 +282,12 @@ def pid(speed, steer, current_speed, current_steer, max_sv, max_a, max_v, min_v)
 
     return accl, sv
 
-def func_KS(x, t, u, mu, C_Sf, C_Sr, lf, lr, h, m, I, s_min, s_max, sv_min, sv_max, v_switch, a_max, v_min, v_max):
-    f = vehicle_dynamics_ks(x, u, mu, C_Sf, C_Sr, lf, lr, h, m, I, s_min, s_max, sv_min, sv_max, v_switch, a_max, v_min, v_max)
+def func_KS(x, t, u, mu, C_Sf, C_Sr, lf, lr, h, m, I, s_min, s_max, sv_min, sv_max, v_switch, a_max, v_min, v_max, Cd_A, rho_air):
+    f = vehicle_dynamics_ks(x, u, mu, C_Sf, C_Sr, lf, lr, h, m, I, s_min, s_max, sv_min, sv_max, v_switch, a_max, v_min, v_max, Cd_A, rho_air)
     return f
 
-def func_ST(x, t, u, mu, C_Sf, C_Sr, lf, lr, h, m, I, s_min, s_max, sv_min, sv_max, v_switch, a_max, v_min, v_max):
-    f = vehicle_dynamics_st(x, u, mu, C_Sf, C_Sr, lf, lr, h, m, I, s_min, s_max, sv_min, sv_max, v_switch, a_max, v_min, v_max)
+def func_ST(x, t, u, mu, C_Sf, C_Sr, lf, lr, h, m, I, s_min, s_max, sv_min, sv_max, v_switch, a_max, v_min, v_max, Cd_A, rho_air, pac_B, pac_C, pac_D_scale, pac_E):
+    f = vehicle_dynamics_st(x, u, mu, C_Sf, C_Sr, lf, lr, h, m, I, s_min, s_max, sv_min, sv_max, v_switch, a_max, v_min, v_max, Cd_A, rho_air, pac_B, pac_C, pac_D_scale, pac_E)
     return f
 
 class DynamicsTest(unittest.TestCase):
@@ -265,12 +327,12 @@ class DynamicsTest(unittest.TestCase):
         acc = 0.63*g
         u = np.array([v_delta,  acc])
 
-        f_ks = vehicle_dynamics_ks(x_ks, u, self.mu, self.C_Sf, self.C_Sr, self.lf, self.lr, self.h, self.m, self.I, self.s_min, self.s_max, self.sv_min, self.sv_max, self.v_switch, self.a_max, self.v_min, self.v_max)
-        f_st = vehicle_dynamics_st(x_st, u, self.mu, self.C_Sf, self.C_Sr, self.lf, self.lr, self.h, self.m, self.I, self.s_min, self.s_max, self.sv_min, self.sv_max, self.v_switch, self.a_max, self.v_min, self.v_max)
+        f_ks = vehicle_dynamics_ks(x_ks, u, self.mu, self.C_Sf, self.C_Sr, self.lf, self.lr, self.h, self.m, self.I, self.s_min, self.s_max, self.sv_min, self.sv_max, self.v_switch, self.a_max, self.v_min, self.v_max, 0.0, 0.0)
+        f_st = vehicle_dynamics_st(x_st, u, self.mu, self.C_Sf, self.C_Sr, self.lf, self.lr, self.h, self.m, self.I, self.s_min, self.s_max, self.sv_min, self.sv_max, self.v_switch, self.a_max, self.v_min, self.v_max, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
         start = time.time()
         for i in range(10000):
-            f_st = vehicle_dynamics_st(x_st, u, self.mu, self.C_Sf, self.C_Sr, self.lf, self.lr, self.h, self.m, self.I, self.s_min, self.s_max, self.sv_min, self.sv_max, self.v_switch, self.a_max, self.v_min, self.v_max)
+            f_st = vehicle_dynamics_st(x_st, u, self.mu, self.C_Sf, self.C_Sr, self.lf, self.lr, self.h, self.m, self.I, self.s_min, self.s_max, self.sv_min, self.sv_max, self.v_switch, self.a_max, self.v_min, self.v_max, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
         duration = time.time() - start
         avg_fps = 10000/duration
 
@@ -303,9 +365,9 @@ class DynamicsTest(unittest.TestCase):
         u = np.array([0., 0.])
 
         # simulate single-track model
-        x_roll_st = odeint(func_ST, x0_ST, t, args=(u, self.mu, self.C_Sf, self.C_Sr, self.lf, self.lr, self.h, self.m, self.I, self.s_min, self.s_max, self.sv_min, self.sv_max, self.v_switch, self.a_max, self.v_min, self.v_max))
+        x_roll_st = odeint(func_ST, x0_ST, t, args=(u, self.mu, self.C_Sf, self.C_Sr, self.lf, self.lr, self.h, self.m, self.I, self.s_min, self.s_max, self.sv_min, self.sv_max, self.v_switch, self.a_max, self.v_min, self.v_max, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
         # simulate kinematic single-track model
-        x_roll_ks = odeint(func_KS, x0_KS, t, args=(u, self.mu, self.C_Sf, self.C_Sr, self.lf, self.lr, self.h, self.m, self.I, self.s_min, self.s_max, self.sv_min, self.sv_max, self.v_switch, self.a_max, self.v_min, self.v_max))
+        x_roll_ks = odeint(func_KS, x0_KS, t, args=(u, self.mu, self.C_Sf, self.C_Sr, self.lf, self.lr, self.h, self.m, self.I, self.s_min, self.s_max, self.sv_min, self.sv_max, self.v_switch, self.a_max, self.v_min, self.v_max, 0.0, 0.0))
 
         self.assertTrue(all(x_roll_st[-1]==x0_ST))
         self.assertTrue(all(x_roll_ks[-1]==x0_KS))
@@ -335,9 +397,9 @@ class DynamicsTest(unittest.TestCase):
         u = np.array([0., -0.7*g])
 
         # simulate single-track model
-        x_dec_st = odeint(func_ST, x0_ST, t, args=(u, self.mu, self.C_Sf, self.C_Sr, self.lf, self.lr, self.h, self.m, self.I, self.s_min, self.s_max, self.sv_min, self.sv_max, self.v_switch, self.a_max, self.v_min, self.v_max))
+        x_dec_st = odeint(func_ST, x0_ST, t, args=(u, self.mu, self.C_Sf, self.C_Sr, self.lf, self.lr, self.h, self.m, self.I, self.s_min, self.s_max, self.sv_min, self.sv_max, self.v_switch, self.a_max, self.v_min, self.v_max, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
         # simulate kinematic single-track model
-        x_dec_ks = odeint(func_KS, x0_KS, t, args=(u, self.mu, self.C_Sf, self.C_Sr, self.lf, self.lr, self.h, self.m, self.I, self.s_min, self.s_max, self.sv_min, self.sv_max, self.v_switch, self.a_max, self.v_min, self.v_max))
+        x_dec_ks = odeint(func_KS, x0_KS, t, args=(u, self.mu, self.C_Sf, self.C_Sr, self.lf, self.lr, self.h, self.m, self.I, self.s_min, self.s_max, self.sv_min, self.sv_max, self.v_switch, self.a_max, self.v_min, self.v_max, 0.0, 0.0))
 
         # ground truth for single-track model
         x_dec_st_gt = [-3.4335000000000013, 0.0000000000000000, 0.0000000000000000, -6.8670000000000018, 0.0000000000000000, 0.0000000000000000, 0.0000000000000000]
@@ -373,9 +435,9 @@ class DynamicsTest(unittest.TestCase):
         u = np.array([0.15, 0.63*g])
 
         # simulate single-track model
-        x_acc_st = odeint(func_ST, x0_ST, t, args=(u, self.mu, self.C_Sf, self.C_Sr, self.lf, self.lr, self.h, self.m, self.I, self.s_min, self.s_max, self.sv_min, self.sv_max, self.v_switch, self.a_max, self.v_min, self.v_max))
+        x_acc_st = odeint(func_ST, x0_ST, t, args=(u, self.mu, self.C_Sf, self.C_Sr, self.lf, self.lr, self.h, self.m, self.I, self.s_min, self.s_max, self.sv_min, self.sv_max, self.v_switch, self.a_max, self.v_min, self.v_max, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
         # simulate kinematic single-track model
-        x_acc_ks = odeint(func_KS, x0_KS, t, args=(u, self.mu, self.C_Sf, self.C_Sr, self.lf, self.lr, self.h, self.m, self.I, self.s_min, self.s_max, self.sv_min, self.sv_max, self.v_switch, self.a_max, self.v_min, self.v_max))
+        x_acc_ks = odeint(func_KS, x0_KS, t, args=(u, self.mu, self.C_Sf, self.C_Sr, self.lf, self.lr, self.h, self.m, self.I, self.s_min, self.s_max, self.sv_min, self.sv_max, self.v_switch, self.a_max, self.v_min, self.v_max, 0.0, 0.0))
 
         # ground truth for single-track model
         x_acc_st_gt = [3.0731976046859715, 0.2869835398304389, 0.1500000000000000, 6.1802999999999999, 0.1097747074946325, 0.3248268063223301, 0.0697547542798040]
@@ -410,9 +472,9 @@ class DynamicsTest(unittest.TestCase):
         u = np.array([0.15, 0.])
 
         # simulate single-track model
-        x_left_st = odeint(func_ST, x0_ST, t, args=(u, self.mu, self.C_Sf, self.C_Sr, self.lf, self.lr, self.h, self.m, self.I, self.s_min, self.s_max, self.sv_min, self.sv_max, self.v_switch, self.a_max, self.v_min, self.v_max))
+        x_left_st = odeint(func_ST, x0_ST, t, args=(u, self.mu, self.C_Sf, self.C_Sr, self.lf, self.lr, self.h, self.m, self.I, self.s_min, self.s_max, self.sv_min, self.sv_max, self.v_switch, self.a_max, self.v_min, self.v_max, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
         # simulate kinematic single-track model
-        x_left_ks = odeint(func_KS, x0_KS, t, args=(u, self.mu, self.C_Sf, self.C_Sr, self.lf, self.lr, self.h, self.m, self.I, self.s_min, self.s_max, self.sv_min, self.sv_max, self.v_switch, self.a_max, self.v_min, self.v_max))
+        x_left_ks = odeint(func_KS, x0_KS, t, args=(u, self.mu, self.C_Sf, self.C_Sr, self.lf, self.lr, self.h, self.m, self.I, self.s_min, self.s_max, self.sv_min, self.sv_max, self.v_switch, self.a_max, self.v_min, self.v_max, 0.0, 0.0))
 
         # ground truth for single-track model
         x_left_st_gt = [0.0000000000000000, 0.0000000000000000, 0.1500000000000000, 0.0000000000000000, 0.0000000000000000, 0.0000000000000000, 0.0000000000000000]
@@ -421,6 +483,7 @@ class DynamicsTest(unittest.TestCase):
 
         self.assertTrue(all(abs(x_left_st[-1] - x_left_st_gt) < 1e-2))
         self.assertTrue(all(abs(x_left_ks[-1] - x_left_ks_gt) < 1e-2))
+
 
 if __name__ == '__main__':
     unittest.main()
